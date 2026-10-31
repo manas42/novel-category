@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# 运行产物：归类结果与训练模型，不入库
+*.csv
+model.json
