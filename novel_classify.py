@@ -644,8 +644,12 @@ def main(argv=None):
     print(f"  低置信 {low}/{len(ok)}（{low/max(1,len(ok))*100:.1f}%）需复核")
     print(f"  扫描 {scan_el/60:.1f} 分钟 | 合计 {el/60:.1f} 分钟 | "
           f"{len(rows)/scan_el:.1f} 本/秒")
-    print(f"  语料 {corpus_mb/1024:.1f} GB，实读抽样 {sampled:.0f} MB"
-          f"（{sampled/max(corpus_mb,1e-9)*100:.1f}%），不上传任何内容")
+    corpus_s = (f"{corpus_mb/1024:.1f} GB" if corpus_mb >= 1024
+                else f"{corpus_mb:.0f} MB")
+    read_s = f"{sampled:.1f} MB" if sampled < 10 else f"{sampled:.0f} MB"
+    pct_s = (f"（{min(100.0, sampled/max(corpus_mb,1e-9)*100):.1f}%）"
+             if corpus_mb >= 1 else "")
+    print(f"  语料 {corpus_s}，实读抽样 {read_s}{pct_s}，不上传任何内容")
     print(f"  结果：{os.path.abspath(a.out)}")
     return 0
 
