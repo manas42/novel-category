@@ -179,6 +179,78 @@ def report(tag, s, elapsed, n):
     return s["acc"]
 
 
+def txts(d):
+    out = []
+    for dp, _, fs in os.walk(d):
+        out.extend(os.path.join(dp, f) for f in fs if f.lower().endswith(".txt"))
+    return out
+
+
+def check(cond, msg):
+    if not cond:
+        raise SystemExit(f"    ✗ 失败：{msg}")
+    print(f"      ✓ {msg}")
+
+
+def check_moves(root):
+    """落盘测试：dry-run 不动手、重名不覆盖、重跑不复发、台账能回滚。"""
+    print("[5/5] 落盘：移动 / 重名 / 幂等 / 回滚")
+    mv = os.path.join(root, "mv_src")
+    dest = os.path.join(root, "sorted")
+    for sub in ("a", "b", "c"):
+        os.makedirs(os.path.join(mv, sub))
+    rng = random.Random(11)
+    for g in ("武侠", "都市", "科幻"):
+        for i in range(3):
+            write_book(os.path.join(mv, f"{g}_{i}.txt"), make_book(rng, g, 0.4), "utf-8")
+    # a 与 c 都是武侠且同名 → 必须自动改名而不是覆盖；b 是都市同样叫同名 → 各归各类
+    write_book(os.path.join(mv, "a", "同名.txt"), make_book(rng, "武侠", 0.4), "utf-8")
+    write_book(os.path.join(mv, "b", "同名.txt"), make_book(rng, "都市", 0.4), "utf-8")
+    write_book(os.path.join(mv, "c", "同名.txt"), make_book(rng, "武侠", 0.4), "utf-8")
+    with open(os.path.join(mv, "太短.txt"), "w", encoding="utf-8") as f:
+        f.write("他走进客栈。" * 3)
+    before = len(txts(mv))
+
+    # 1) dry-run：什么都不该改
+    run([sys.executable, SCRIPT, mv, "--move-to", dest, "--dry-run",
+         "--calibrate", "off"])
+    check(not os.path.isdir(dest), "dry-run 没有创建目标目录、没有搬任何文件")
+    check(len(txts(mv)) == before, f"dry-run 后原目录仍是 {before} 个文件")
+
+    # 2) 真搬
+    _, el = run([sys.executable, SCRIPT, mv, "--move-to", dest,
+                 "--calibrate", "off"])
+    in_dest = txts(dest)
+    check(len(in_dest) == before - 1, f"搬走 {before - 1} 本，太短的文件留下")
+    check(len(txts(mv)) == 1, "原目录只剩那个过短文件")
+    names = sorted(os.path.basename(p) for p in in_dest
+                   if os.path.dirname(p).endswith("武侠"))
+    check("同名.txt" in names and "同名 (2).txt" in names,
+          f"同名武侠文件自动改名不覆盖：{names}")
+    check(len([p for p in in_dest if p.endswith("同名.txt")]) == 2,
+          "都市与武侠各自的同名文件分别落袋")
+    check(all(os.path.basename(os.path.dirname(p)) in
+              ("武侠", "都市", "科幻") for p in in_dest),
+          "全部落在 类别/ 子目录下")
+
+    # 3) 幂等：再跑一次不该重复搬
+    r = subprocess.run([sys.executable, SCRIPT, mv, "--move-to", dest,
+                        "--calibrate", "off"], capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    check(len(txts(dest)) == len(in_dest),
+          "重跑后目标目录文件数不变（已搬走的不会重复搬）")
+    check("跳过(类别不搬): 1" in out and "  move:" not in out,
+          "重跑时把仅剩的过短文件按类别跳过，没有误搬")
+
+    # 4) 回滚
+    mf = os.path.join(dest, ".move-manifest.csv")
+    check(os.path.exists(mf), "生成了台账 .move-manifest.csv")
+    run([sys.executable, SCRIPT, "--undo", mf])
+    check(len(txts(mv)) == before, f"回滚后原目录恢复 {before} 个文件")
+    check(len(txts(dest)) == 0, "目标目录已清空")
+    print(f"      搬运用时 {el:.1f}s")
+
+
 def main():
     root = tempfile.mkdtemp(prefix="nc_selftest_")
     try:
@@ -256,6 +328,8 @@ def main():
             print(f"        {os.path.basename(r['path']):<16}"
                   f" → {r['label']:<8} conf={r['confidence']:<5} "
                   f"enc={r['encoding']:<10} {r['evidence'][:32]}")
+
+        check_moves(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("\n自测完成。")

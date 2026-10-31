@@ -23,6 +23,11 @@ novel_classify.py —— 本地批量小说风格归类（纯标准库，零依�
     # 3) 先小规模试跑，看低置信度比例，再上全量
     python3 novel_classify.py /volume1/novels --limit 300 --out 试跑.csv
 
+    # 4) 直接落盘：把每本移进 目标目录/<类别>/（没有就建）
+    python3 novel_classify.py /volume1/novels --move-to /volume1/分类 --dry-run  # 先看计划
+    python3 novel_classify.py /volume1/novels --move-to /volume1/分类            # 真的搬
+    python3 novel_classify.py --undo /volume1/分类/.move-manifest.csv            # 后悔了搬回来
+
 输出 CSV：路径、大小、编码、抽样汉字数、类别、置信度、次选、低置信标记、
 判定依据（命中的特征词）、各题材原始得分（可选近似重复指纹）。
 低置信度的行再拿去人工/LLM 复核——每本只需 2 KB 摘要，不是全篇。
@@ -30,10 +35,12 @@ novel_classify.py —— 本地批量小说风格归类（纯标准库，零依�
 
 import argparse
 import csv
+import errno
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
 import zlib
@@ -492,25 +499,159 @@ def finalize(rows, threshold=0.45, calibrate="auto", model=None):
     return rows
 
 
-def iter_txt(paths, exts, limit):
+def iter_txt(paths, exts, limit, exclude=()):
+    """遍历 txt。exclude 是要避开的目录（落盘目标），否则会把自己的输出再扫一遍。"""
     n, seen = 0, set()
+    ex = tuple(os.path.realpath(e) for e in exclude)
+
+    def skip(p):
+        return any(p == e or p.startswith(e + os.sep) for e in ex)
+
     for root_path in paths:
         if os.path.isfile(root_path):
             candidates = [root_path]
         else:
-            candidates = [os.path.join(dp, f)
-                          for dp, _, fs in os.walk(root_path) for f in fs]
+            candidates = []
+            for dp, dns, fns in os.walk(root_path):
+                rdp = os.path.realpath(dp)
+                dns[:] = [d for d in dns if not skip(os.path.join(rdp, d))]
+                candidates.extend(os.path.join(dp, f) for f in fns)
         for p in candidates:
             if os.path.splitext(p)[1].lower() not in exts:
                 continue
             rp = os.path.realpath(p)
-            if rp in seen:      # 硬链接/重复挂载去重
+            if rp in seen or skip(rp):    # 硬链接/重复挂载去重
                 continue
             seen.add(rp)
             yield p
             n += 1
             if limit and n >= limit:
                 return
+
+
+# ---------------------------------------------------------------- 落盘（移动/复制）
+
+MANIFEST_NAME = ".move-manifest.csv"
+FS_BAD = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+DEFAULT_SKIP = "过短/非正文,读取失败"
+
+
+def safe_label(label):
+    """类别名当目录名时换掉非法字符（Windows/群晖/威联通都不接受这些）。"""
+    s = FS_BAD.sub("_", label).strip().strip(".")
+    return s or DEFAULT_GENRE
+
+
+def unique_path(dst):
+    """目标重名就加 (2)(3)…，绝不覆盖已有文件。"""
+    if not os.path.exists(dst):
+        return dst
+    root, ext = os.path.splitext(dst)
+    i = 2
+    while True:
+        cand = f"{root} ({i}){ext}"
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def transfer(src, dst, copy_mode):
+    """同盘直接 rename（瞬时）；跨盘/跨网盘 rename 会 EXDEV，退回 copy2+删除。"""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if copy_mode:
+        shutil.copy2(src, dst)
+        return
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(src, dst)
+
+
+def do_move(rows, dest, copy_mode=False, dry_run=False, skip_labels=(),
+            manifest=None):
+    """按判定结果把文件搬进 dest/<类别>/。逐行写台账，中断也能回滚。"""
+    dest = os.path.abspath(dest)
+    if not dry_run:
+        os.makedirs(dest, exist_ok=True)
+    manifest = os.path.abspath(manifest or os.path.join(dest, MANIFEST_NAME))
+    stats = Counter()
+    fh = None
+    if not dry_run:
+        fresh = not os.path.exists(manifest) or os.path.getsize(manifest) == 0
+        fh = open(manifest, "a", encoding="utf-8-sig", newline="")
+        w = csv.writer(fh)
+        if fresh:
+            w.writerow(["ts", "action", "src", "dst", "label",
+                        "confidence", "ok", "error"])
+    try:
+        for i, r in enumerate(rows, 1):
+            src = r["path"]
+            label = r.get("label", DEFAULT_GENRE)
+            if label in skip_labels:
+                stats["跳过(类别不搬)"] += 1
+                continue
+            if not os.path.exists(src):
+                stats["跳过(已不存在)"] += 1
+                continue
+            target_dir = os.path.join(dest, safe_label(label))
+            want = os.path.join(target_dir, os.path.basename(src))
+            dst = unique_path(want)
+            if dst != want:
+                stats["重名改名"] += 1
+            action = "copy" if copy_mode else "move"
+            if dry_run:
+                print(f"[计划] {label:<8} {src}  ->  {dst}")
+                stats["计划"] += 1
+                continue
+            try:
+                transfer(src, dst, copy_mode)
+                stats[action] += 1
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), action, src,
+                            dst, label, r.get("confidence", ""), 1, ""])
+            except OSError as e:
+                stats["失败"] += 1
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), action, src,
+                            dst, label, r.get("confidence", ""), 0,
+                            str(e)[:200]])
+                print(f"[失败] {src}: {e}", file=sys.stderr)
+            fh.flush()          # 关键：逐行落盘，跑到一半断电也能按台账回滚
+            if i % 500 == 0:
+                print(f"  已处理 {i}/{len(rows)}", flush=True)
+    finally:
+        if fh:
+            fh.close()
+    return stats, manifest
+
+
+def do_undo(manifest, dry_run=False):
+    """按台账把文件搬回原位（逆序处理，原位被占则加后缀，不覆盖）。"""
+    if not os.path.exists(manifest):
+        sys.exit(f"台账不存在：{manifest}")
+    with open(manifest, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    stats = Counter()
+    for row in reversed(rows):
+        if row.get("action") != "move" or row.get("ok") != "1":
+            stats["跳过(记录)"] += 1
+            continue
+        src, dst = row["src"], row["dst"]
+        if not os.path.exists(dst):
+            stats["跳过(已不在目标处)"] += 1
+            continue
+        back = unique_path(src)
+        if dry_run:
+            print(f"[计划回滚] {dst}  ->  {back}")
+            stats["计划"] += 1
+            continue
+        try:
+            transfer(dst, back, False)
+            stats["已回滚"] += 1
+        except OSError as e:
+            stats["失败"] += 1
+            print(f"[失败] {dst}: {e}", file=sys.stderr)
+    return stats, len(rows)
 
 
 # ---------------------------------------------------------------- 训练
@@ -586,7 +727,26 @@ def main(argv=None):
     ap.add_argument("--csv-encoding", default="utf-8-sig",
                     help="CSV 编码，默认带 BOM 便于 Excel 打开")
     ap.add_argument("--progress-every", type=int, default=200)
+    ap.add_argument("--move-to", metavar="DIR",
+                    help="真正落盘：把每个文件移动/复制到 DIR/<类别>/（不存在则创建）")
+    ap.add_argument("--copy", action="store_true",
+                    help="配合 --move-to：复制而不是移动（原文件保留）")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只打印将要做什么，不改动任何文件")
+    ap.add_argument("--skip-labels", default=DEFAULT_SKIP,
+                    help=f"这些类别不搬，逗号分隔（默认 {DEFAULT_SKIP}）")
+    ap.add_argument("--manifest",
+                    help=f"落盘台账路径（默认 <DIR>/{MANIFEST_NAME}），--undo 用它回滚")
+    ap.add_argument("--undo", metavar="MANIFEST",
+                    help="按台账把文件搬回原位")
     a = ap.parse_args(argv)
+
+    if a.undo:
+        stats, total = do_undo(a.undo, a.dry_run)
+        print(f"台账 {total} 行：")
+        for k, v in stats.most_common():
+            print(f"  {k}: {v}")
+        return 0
 
     if a.train:
         do_train(a.train, a.model_out, a.sample_bytes)
@@ -601,7 +761,8 @@ def main(argv=None):
 
     exts = {e if e.startswith(".") else "." + e
             for e in a.ext.lower().split(",")}
-    files = list(iter_txt(a.paths, exts, a.limit))
+    files = list(iter_txt(a.paths, exts, a.limit,
+                          exclude=[a.move_to] if a.move_to else []))
     if not files:
         sys.exit("没有找到符合条件的文件")
     print(f"文件 {len(files)} 个 | 抽样 {a.sample_bytes/1024:.0f} KB/本 | "
@@ -651,6 +812,16 @@ def main(argv=None):
              if corpus_mb >= 1 else "")
     print(f"  语料 {corpus_s}，实读抽样 {read_s}{pct_s}，不上传任何内容")
     print(f"  结果：{os.path.abspath(a.out)}")
+
+    if a.move_to:
+        skip = {x.strip() for x in a.skip_labels.split(",") if x.strip()}
+        print(f"\n== {'复制' if a.copy else '移动'}到 {os.path.abspath(a.move_to)} "
+              f"{'（演练，不动文件）' if a.dry_run else ''} ==")
+        stats, mf = do_move(rows, a.move_to, a.copy, a.dry_run, skip, a.manifest)
+        for k, v in stats.most_common():
+            print(f"  {k}: {v}")
+        if not a.dry_run:
+            print(f"  台账（可 --undo 回滚）：{mf}")
     return 0
 
 

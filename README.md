@@ -25,7 +25,12 @@ python3 novel_classify.py /volume1/novels --limit 300 --out 试跑.csv
 python3 novel_classify.py --train ./seeds --model-out model.json
 python3 novel_classify.py /volume1/novels --model model.json --out 归类.csv
 
-# 4) 顺手查重复转载的书（出版社/网站重复收录很常见）
+# 4) 直接落盘：把每本搬进 目标目录/<类别>/（没有就自动建）
+python3 novel_classify.py /volume1/novels --move-to /volume1/分类 --dry-run   # 先看计划
+python3 novel_classify.py /volume1/novels --move-to /volume1/分类             # 真的搬
+python3 novel_classify.py --undo /volume1/分类/.move-manifest.csv             # 后悔了搬回来
+
+# 5) 顺手查重复转载的书（出版社/网站重复收录很常见）
 python3 novel_classify.py /volume1/novels --simhash --out 归类.csv
 ```
 
@@ -45,6 +50,39 @@ python3 novel_classify.py /volume1/novels --simhash --out 归类.csv
 | `evidence` | 判定依据（命中的特征词及次数，人工一眼能验） |
 | `s_*` | 各题材原始得分 |
 | `simhash` | 近似重复指纹（`--simhash`） |
+
+## 落盘：直接归位到类别目录
+
+加 `--move-to DIR` 就不只写 CSV，而是把每个文件搬进 `DIR/<类别>/`，目录不存在自动创建：
+
+```
+/volume1/分类/
+├── 武侠/        《剑客行》.txt  《刀锋》.txt
+├── 仙侠修真/
+├── 都市/
+├── 未分类/      ← 判不出来的也归一处，不会散在原目录
+└── .move-manifest.csv   ← 台账，回滚用
+```
+
+所有操作都按这几个前提下设计，因为动的是原始书库：
+
+| 风险 | 处理 |
+|---|---|
+| 判错就挪错位置 | 先 `--dry-run` 打印完整计划，一行不动；确认后再跑 |
+| 目标已有同名文件 | **绝不覆盖**，自动改成 `名字 (2).txt`；`s_*` 分数与台账都在 CSV 里 |
+| 目标目录在别的盘 | 同盘 `rename` 瞬时完成；跨盘/跨网盘自动退回 `copy2` + 删除 |
+| 中途中断 | 台账**逐行 flush**，跑到一半断电，已搬的也能用 `--undo` 搬回 |
+| 重跑一次 | 安全：已搬走的不会被再扫到；落盘目录本身被排除出扫描范围 |
+| 把杂文件也搬走 | 默认跳过 `过短/非正文`、`读取失败`；`--skip-labels` 可改 |
+| 想留原件 | 加 `--copy`，复制不移动（磁盘占用翻倍，跨盘时更慢） |
+
+台账 `--undo` 是逆序回滚，原位被占则加后缀而不会覆盖：
+
+```bash
+python3 novel_classify.py --undo /volume1/分类/.move-manifest.csv
+```
+
+`--copy` 仍会记台账（`action=copy`），但 `--undo` 只回滚 `move` 行——复制没有「搬回」语义，要撤销就自己删副本。
 
 ## 两条判定路径
 
